@@ -1,0 +1,609 @@
+---
+title: "Who Votes in Toronto?"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    css: |
+      @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Serif+Display&display=swap');
+      body, .navbar { font-family: 'DM Sans', sans-serif !important; }
+      .navbar { background-color: #1a2744 !important; border: none !important; }
+      .navbar-brand { font-family: 'DM Serif Display', serif !important;
+                      font-size: 1.2rem !important; color: #f5f4f0 !important; }
+      .navbar-text { color: #c8d8f0 !important; font-size: 0.78rem !important; }
+      body { background-color: #f5f4f0 !important; }
+      .chart-stage { background: #ffffff; border-radius: 8px; }
+      .insight-box { background: #1a2744; color: #f5f4f0; border-radius: 8px;
+                     padding: 10px 14px; margin-bottom: 6px;
+                     font-size: 0.83rem; line-height: 1.65; }
+      .insight-box strong { color: #c8d8f0; }
+      .insight-sel { border-left: 3px solid #f4a261; }
+      .ward-card { background: #f0f4fa; border-radius: 7px; padding: 10px;
+                   text-align: center; }
+      .ward-card .wnum { font-size: 1.1rem; font-weight: 700;
+                         color: #1a2744; margin: 0; }
+      .ward-card .wlbl { font-size: 0.7rem; color: #555; margin: 0; }
+      .rank-row { display: flex; align-items: center; gap: 10px;
+                  font-size: 0.82rem; color: #1a2744; margin-bottom: 4px; }
+      .rank-label { width: 160px; flex-shrink: 0; color: #333; font-weight: 500; }
+      .rank-bar-bg { flex: 1; background: #e8eef6; border-radius: 4px; height: 8px; }
+      .rank-bar-fill { height: 8px; border-radius: 4px; background: #4a90c4; }
+      .rank-badge { font-weight: 700; color: #1a2744; white-space: nowrap;
+                    text-align: right; font-size: 0.82rem; min-width: 120px; }
+      select { border-radius: 6px !important; border: 1.5px solid #1a2744 !important;
+               font-family: 'DM Sans', sans-serif !important; }
+      .hint-txt { font-size: 0.75rem; color: #999; margin-top: 4px; }
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(readxl)
+library(dplyr)
+library(janitor)
+library(tidyr)
+library(stringr)
+library(leaflet)
+library(plotly)
+library(sf)
+library(RColorBrewer)
+```
+
+```{r data, include=FALSE}
+# Data cleaning
+ward_lookup <- read_excel("25-wardnames-numbers.xlsx")
+voter_stats <- read_excel("2023-mayoral-by-election-voter-statistics.xlsx",
+  sheet = "2023 Voter Turnout Statisti M")
+ward_census <- read_excel("2023-WardProfiles-2011-2021-CensusData.xlsx",
+  sheet = "2021 One Variable")
+ward_geo    <- read_excel("2023-WardProfiles-GeographicAreas.xlsx")
+
+#Clean ward_lookup
+lookup_clean <- ward_lookup
+names(lookup_clean) <- c("ward", "ward_name")
+lookup_clean <- lookup_clean %>%
+  mutate(ward = as.numeric(ward), ward_name = as.character(ward_name)) %>%
+  filter(!is.na(ward))
+lookup_clean <- bind_rows(tibble(ward = 0, ward_name = "Toronto"), lookup_clean)
+lookup_clean <- lookup_clean %>% mutate(ward = as.numeric(ward))
+
+voter_clean <- voter_stats %>%
+  clean_names() %>%
+  mutate(ward = as.character(ward), ward = trimws(ward)) %>%
+  filter(!is.na(ward), ward != "", grepl("^[0-9]+$", ward)) %>%
+  mutate(
+    ward = as.numeric(ward),
+    total_eligible_electors = as.numeric(gsub(",", "", total_eligible_electors)),
+    number_voted             = as.numeric(gsub(",", "", number_voted))
+  ) %>%
+  group_by(ward) %>%
+  summarise(
+    eligible_voters = sum(total_eligible_electors, na.rm = TRUE),
+    number_voted    = sum(number_voted, na.rm = TRUE),
+    percent_voted   = number_voted / eligible_voters * 100,
+    .groups = "drop"
+  ) %>%
+  left_join(lookup_clean, by = "ward") %>%
+  select(ward, ward_name, eligible_voters, number_voted, percent_voted)
+
+#Clean voter_stats
+toronto_voter <- voter_clean %>%
+  summarise(ward = 0, ward_name = "Toronto",
+    eligible_voters = sum(eligible_voters, na.rm = TRUE),
+    number_voted    = sum(number_voted, na.rm = TRUE),
+    percent_voted   = number_voted / eligible_voters * 100)
+voter_clean <- bind_rows(toronto_voter, voter_clean)
+
+#Clean ward_census
+names(ward_census)[1] <- "indicator"
+names(ward_census)[2:ncol(ward_census)] <-
+  c("toronto", paste0("ward_", 1:(ncol(ward_census) - 2)))
+
+ward_census$indicator <- ward_census$indicator %>%
+  iconv(to = "UTF-8") %>%
+  chartr("\u2018\u2019\u201C\u201D", "''\"\"", .)
+
+ward_census2 <- ward_census %>%
+  filter(!if_all(everything(), is.na)) %>%
+  filter(!is.na(indicator)) %>%
+  filter(!indicator %in% c("2021 Census","Source:",
+    "Statistics Canada, 2021 Census, Custom Tabulations, 2023.",
+    "Wards:","25 Ward model","Prepared by:",
+    "Strategic Initiatives, Policy & Analysis",
+    "City Planning Division, City of Toronto","December, 2023"))
+
+keep_rows <- c(
+  "Total - Age","0 to 4 years","5 to 9 years","10 to 14 years",
+  "15 to 19 years","20 to 24 years","25 to 29 years","30 to 34 years",
+  "35 to 39 years","40 to 44 years","45 to 49 years","50 to 54 years",
+  "55 to 59 years","60 to 64 years","65 to 69 years","70 to 74 years",
+  "75 to 79 years","80 to 84 years","85 to 89 years","90 years and over",
+  "Median age","Non-immigrants","Immigrants",
+  "Total - Highest certificate, diploma or degree for the population aged 15 years and over in private households - 25% sample data",
+  "No certificate, diploma or degree",
+  "High (secondary) school diploma or equivalency certificate",
+  "Postsecondary certificate, diploma or degree",
+  "Postsecondary certificate or diploma below bachelor level",
+  "Apprenticeship or trades certificate or diploma",
+  "Non-apprenticeship trades certificate or diploma","Apprenticeship certificate",
+  "College, CEGEP or other non-university certificate or diploma",
+  "University certificate or diploma below bachelor level",
+  "Bachelor's degree or higher","Bachelor's degree",
+  "University certificate or diploma above bachelor level",
+  "Degree in medicine, dentistry, veterinary medicine or optometry",
+  "Master's degree","Earned doctorate",
+  "Total - Population aged 15 years and over by Labour force status - 25% sample data",
+  "In the labour force","Employed","Unemployed","Not in the labour force",
+  "Unemployment rate",
+  "Total - Household total income groups in 2020 for private households - 25% sample data",
+  "Under $5,000","$5,000 to $9,999","$10,000 to $14,999","$15,000 to $19,999",
+  "$20,000 to $24,999","$25,000 to $29,999","$30,000 to $34,999","$35,000 to $39,999",
+  "$40,000 to $44,999","$45,000 to $49,999","$50,000 to $59,999","$60,000 to $69,999",
+  "$70,000 to $79,999","$80,000 to $89,999","$90,000 to $99,999","$100,000 and over",
+  "$100,000 to $124,999","$125,000 to $149,999","$150,000 to $199,999","$200,000 and over")
+
+census_selected <- ward_census2 %>%
+  filter(indicator %in% keep_rows) %>%
+  select(indicator, toronto, starts_with("ward_")) %>%
+  distinct(indicator, .keep_all = TRUE)
+
+census_mat           <- as.data.frame(census_selected, stringsAsFactors = FALSE)
+rownames(census_mat) <- census_mat$indicator
+census_mat$indicator <- NULL
+census_clean         <- as.data.frame(t(census_mat), stringsAsFactors = FALSE)
+census_clean$region  <- rownames(census_clean)
+rownames(census_clean) <- NULL
+census_clean <- census_clean %>% select(region, everything()) %>%
+  mutate(ward = case_when(region == "toronto" ~ 0,
+    TRUE ~ suppressWarnings(as.numeric(str_remove(region, "ward_"))))) %>%
+  mutate(across(-c(region, ward), ~ as.numeric(gsub(",", "", .)))) %>%
+  select(-region) %>%
+  left_join(lookup_clean, by = "ward") %>%
+  select(ward, ward_name, everything())
+
+#Combine census_clean categories
+census_clean <- census_clean %>%
+  transmute(ward, ward_name,
+    age_0_to_14  = `0 to 4 years`+`5 to 9 years`+`10 to 14 years`,
+    age_15_to_24 = `15 to 19 years`+`20 to 24 years`,
+    age_25_to_44 = `25 to 29 years`+`30 to 34 years`+`35 to 39 years`+`40 to 44 years`,
+    age_45_to_64 = `45 to 49 years`+`50 to 54 years`+`55 to 59 years`+`60 to 64 years`,
+    age_65_plus  = `65 to 69 years`+`70 to 74 years`+`75 to 79 years`+
+                   `80 to 84 years`+`85 to 89 years`+`90 years and over`,
+    highschool_diploma_or_under =
+      `No certificate, diploma or degree`+
+      `High (secondary) school diploma or equivalency certificate`,
+    edu_college_trades =
+      `Postsecondary certificate or diploma below bachelor level`+
+      `Apprenticeship or trades certificate or diploma`+
+      `Non-apprenticeship trades certificate or diploma`+`Apprenticeship certificate`+
+      `College, CEGEP or other non-university certificate or diploma`+
+      `University certificate or diploma below bachelor level`,
+    edu_bachelor_plus   = `Bachelor's degree or higher`,
+    immigrants          = Immigrants,
+    non_immigrants      = `Non-immigrants`,
+    in_labour_force     = `In the labour force`,
+    employed            = Employed, unemployed = Unemployed,
+    not_in_labour_force = `Not in the labour force`,
+    unemployment_rate   = `Unemployment rate`,
+    income_under_30k  = `Under $5,000`+`$5,000 to $9,999`+`$10,000 to $14,999`+
+                        `$15,000 to $19,999`+`$20,000 to $24,999`+`$25,000 to $29,999`,
+    income_30k_to_59k = `$30,000 to $34,999`+`$35,000 to $39,999`+`$40,000 to $44,999`+
+                        `$45,000 to $49,999`+`$50,000 to $59,999`,
+    income_60k_to_99k = `$60,000 to $69,999`+`$70,000 to $79,999`+
+                        `$80,000 to $89,999`+`$90,000 to $99,999`,
+    income_100k_plus  = `$100,000 to $124,999`+`$125,000 to $149,999`+
+                        `$150,000 to $199,999`+`$200,000 and over`)
+
+#Clean ward_geo
+geo_clean <- ward_geo[-(1:11), ]
+names(geo_clean) <- c("ward", "area_sq_km")
+geo_clean <- geo_clean %>%
+  mutate(ward = as.numeric(ward), area_sq_km = as.numeric(area_sq_km)) %>%
+  filter(!is.na(ward))
+toronto_area <- geo_clean %>% summarise(ward=0, area_sq_km=sum(area_sq_km,na.rm=TRUE))
+geo_clean <- bind_rows(toronto_area, geo_clean) %>%
+  left_join(lookup_clean, by="ward") %>% select(ward, ward_name, everything())
+
+#All data merged into 1 dataset
+final_data <- voter_clean %>%
+  left_join(census_clean, by=c("ward","ward_name")) %>%
+  left_join(geo_clean,    by=c("ward","ward_name"))
+
+# ── End Of Data Cleaning ────────────────────────────────────────────────────
+# CHANGE 1: Added new pct columns for all income/edu/age/immigration sub-categories
+scatter_data <- final_data %>%
+  filter(ward != 0) %>%
+  mutate(
+    total_edu             = highschool_diploma_or_under+edu_college_trades+edu_bachelor_plus,
+    pct_no_diploma        = ifelse(total_edu>0, highschool_diploma_or_under/total_edu*100, NA),
+    pct_college_trades    = ifelse(total_edu>0, edu_college_trades/total_edu*100, NA),
+    pct_bachelor_plus     = ifelse(total_edu>0, edu_bachelor_plus/total_edu*100, NA),
+    total_income          = income_under_30k+income_30k_to_59k+income_60k_to_99k+income_100k_plus,
+    pct_income_under_30k  = ifelse(total_income>0, income_under_30k/total_income*100, NA),
+    pct_income_30k_to_59k = ifelse(total_income>0, income_30k_to_59k/total_income*100, NA),
+    pct_income_60k_to_99k = ifelse(total_income>0, income_60k_to_99k/total_income*100, NA),
+    pct_income_100k_plus  = ifelse(total_income>0, income_100k_plus/total_income*100, NA),
+    total_age             = age_0_to_14+age_15_to_24+age_25_to_44+age_45_to_64+age_65_plus,
+    pct_age_0_to_14       = ifelse(total_age>0, age_0_to_14/total_age*100, NA),
+    pct_age_15_to_24      = ifelse(total_age>0, age_15_to_24/total_age*100, NA),
+    pct_age_25_to_44      = ifelse(total_age>0, age_25_to_44/total_age*100, NA),
+    pct_age_45_to_64      = ifelse(total_age>0, age_45_to_64/total_age*100, NA),
+    pct_age_65_plus       = ifelse(total_age>0, age_65_plus/total_age*100, NA),
+    total_imm             = immigrants+non_immigrants,
+    pct_immigrants        = ifelse(total_imm>0, immigrants/total_imm*100, NA),
+    pct_non_immigrants    = ifelse(total_imm>0, non_immigrants/total_imm*100, NA))
+
+toronto_row <- final_data %>% filter(ward == 0)
+avg_turnout <- round(toronto_row$percent_voted, 1)
+total_voted <- format(toronto_row$number_voted,    big.mark=",")
+total_elig  <- format(toronto_row$eligible_voters, big.mark=",")
+
+# Load ward GeoJSON (must be in same folder as this .Rmd)
+map_sf <- tryCatch({
+  ws <- sf::st_read("toronto_wards.geojson", quiet=TRUE)
+  id_col <- "AREA_SHORT_CODE"
+  ws$ward <- as.integer(as.character(ws[[id_col]]))
+  ws %>% left_join(scatter_data, by="ward") %>% filter(!is.na(percent_voted))
+}, error = function(e) NULL)
+
+# CHANGE 2: get_x now takes attr + sub to support two-level dropdown
+get_x <- function(df, attr, sub) {
+  switch(paste(attr, sub, sep="_"),
+    income_under30k   = list(x=df$pct_income_under_30k,  lbl="% of households earning under $30k"),
+    income_100kplus   = list(x=df$pct_income_100k_plus,  lbl="% of households earning $100k+"),
+    education_nodip   = list(x=df$pct_no_diploma,        lbl="% of population with no diploma / high school"),
+    education_college = list(x=df$pct_college_trades,    lbl="% of population with college / trades"),
+    education_bach    = list(x=df$pct_bachelor_plus,     lbl="% of population with bachelor's degree or higher"),
+    age_0to14         = list(x=df$pct_age_0_to_14,       lbl="% of population aged 0-14"),
+    age_15to24        = list(x=df$pct_age_15_to_24,      lbl="% of population aged 15-24"),
+    age_25to44        = list(x=df$pct_age_25_to_44,      lbl="% of population aged 25-44"),
+    age_45to64        = list(x=df$pct_age_45_to_64,      lbl="% of population aged 45-64"),
+    age_65plus        = list(x=df$pct_age_65_plus,       lbl="% of population aged 65+"),
+    immigration_imm   = list(x=df$pct_immigrants,        lbl="% of population who are immigrants"),
+    immigration_nonimm= list(x=df$pct_non_immigrants,    lbl="% of population who are non-immigrants")
+  )
+}
+
+sub_choices <- list(
+  income    = c("Under $30k"="under30k","$100k+"="100kplus"),
+  education = c("No Diploma / High School"="nodip",
+                "College / Trades"="college","Bachelor's+"="bach"),
+  age       = c("Age 0-14"="0to14","Age 15-24"="15to24","Age 25-44"="25to44",
+                "Age 45-64"="45to64","Age 65+"="65plus"),
+  immigration = c("Immigrants"="imm","Non-immigrants"="nonimm")
+)
+
+# Helper: compute rank (1 = highest) among all 25 wards
+ward_rank <- function(col, val) {
+  rank(-col, ties.method="min")[which(round(col, 6) == round(val, 6))][1]
+}
+```
+
+# Dashboard
+
+## Row {data-height=80}
+
+### {.no-title}
+```{r banner}
+div(style="display:flex;align-items:center;justify-content:space-between;
+           padding:16px 28px;background:#1a2744;border-radius:8px;",
+  div(style="color:#f5f4f0;",
+    tags$p(style="margin:0;font-size:1.2rem;opacity:0.65;letter-spacing:.08em;",
+           "CIVIC VITALITY \u00b7 TORONTO 2023 MAYORAL BY-ELECTION"),
+    tags$h3(style="margin:0;font-family:'DM Sans',sans-serif;font-weight:600;font-size:1.9rem;letter-spacing:0.01em;",
+            "Who Votes in Toronto?")),
+  div(style="display:flex;gap:48px;",
+    lapply(list(list(paste0(avg_turnout,"%"),"City-wide Turnout"),
+                list(total_voted,"Votes Cast"),
+                list(total_elig,"Eligible Voters")),
+      function(s) div(style="text-align:center;color:#f5f4f0;",
+        tags$p(style="margin:0;font-size:1.8rem;font-weight:700;",s[[1]]),
+        tags$p(style="margin:0;font-size:1.2rem;opacity:0.65;",s[[2]])))))
+```
+
+## Row {data-height=500}
+
+### Toronto Ward Map — Voter Turnout {data-width=480}
+
+```{r map-panel}
+selected_ward <- reactiveVal(NULL)
+leafletOutput("ward_map", height="100%")
+output$ward_map <- renderLeaflet({
+  pal <- colorNumeric(c("#e8d5f5","#9b59b6","#4a235a"),
+                      domain=scatter_data$percent_voted, na.color="#ccc")
+  if (!is.null(map_sf) && nrow(map_sf)>0) {
+    lbl <- sprintf(
+      "<strong>Ward %s \u2014 %s</strong><br/>Turnout: <strong>%.1f%%</strong><br/>Votes: %s",
+      map_sf$ward, map_sf$ward_name,
+      map_sf$percent_voted, format(map_sf$number_voted, big.mark=",")) %>%
+      lapply(htmltools::HTML)
+    leaflet(map_sf) %>%
+      addProviderTiles("CartoDB.Positron") %>%
+      addPolygons(
+        layerId=~ward, fillColor=~pal(percent_voted), fillOpacity=0.8,
+        color="#fff", weight=1.5,
+        highlightOptions=highlightOptions(
+          weight=3,color="#f4a261",fillOpacity=0.95,bringToFront=TRUE),
+        label=lbl,
+        labelOptions=labelOptions(
+          style=list("font-family"="DM Sans,sans-serif","font-size"="12px"),
+          direction="auto")) %>%
+      addLegend(pal=pal, values=~percent_voted, title="Voter Turnout (%)",
+                position="bottomright", labFormat=labelFormat(suffix="%")) %>%
+      setView(lng=-79.38, lat=43.72, zoom=10)
+  } else {
+    ward_centroids <- tibble(ward=1:25,
+      lat=c(43.740,43.652,43.614,43.645,43.695,43.705,43.720,43.693,43.668,43.705,
+            43.718,43.715,43.686,43.672,43.687,43.702,43.680,43.665,43.648,43.638,
+            43.700,43.720,43.755,43.770,43.780),
+      lon=c(-79.561,-79.514,-79.482,-79.447,-79.478,-79.400,-79.360,-79.330,-79.300,
+            -79.280,-79.259,-79.240,-79.353,-79.384,-79.430,-79.465,-79.388,-79.365,
+            -79.372,-79.388,-79.310,-79.296,-79.310,-79.350,-79.390))
+    d <- scatter_data %>% left_join(ward_centroids, by="ward")
+    lbl <- sprintf(
+      "<strong>Ward %s \u2014 %s</strong><br/>Turnout: <strong>%.1f%%</strong>",
+      d$ward, d$ward_name, d$percent_voted) %>% lapply(htmltools::HTML)
+    leaflet(d) %>%
+      addProviderTiles("CartoDB.Positron") %>%
+      addCircleMarkers(lng=~lon, lat=~lat, layerId=~ward,
+        radius=10, fillColor=~pal(percent_voted), fillOpacity=0.85,
+        color="#fff", weight=1.5, label=lbl,
+        labelOptions=labelOptions(
+          style=list("font-family"="DM Sans,sans-serif"),direction="auto")) %>%
+      addLegend(pal=pal, values=~percent_voted, title="Voter Turnout (%)",
+                position="bottomright", labFormat=labelFormat(suffix="%")) %>%
+      setView(lng=-79.38, lat=43.72, zoom=10)
+  }
+})
+observeEvent(input$ward_map_shape_click, {
+  w <- as.numeric(input$ward_map_shape_click$id)
+  if (!is.null(selected_ward()) && selected_ward()==w) selected_ward(NULL) else selected_ward(w)
+})
+observeEvent(input$ward_map_marker_click, {
+  w <- as.numeric(input$ward_map_marker_click$id)
+  if (!is.null(selected_ward()) && selected_ward()==w) selected_ward(NULL) else selected_ward(w)
+})
+observeEvent(selected_ward(), {
+  sel_w <- selected_ward()
+  pal <- colorNumeric(c("#e8d5f5","#9b59b6","#4a235a"),
+                      domain=scatter_data$percent_voted, na.color="#ccc")
+  if (!is.null(map_sf) && nrow(map_sf)>0) {
+    proxy <- leafletProxy("ward_map")
+    proxy %>% clearShapes()
+    for (i in seq_len(nrow(map_sf))) {
+      row     <- map_sf[i, ]
+      is_sel  <- !is.null(sel_w) && isTRUE(row$ward == sel_w)
+      fc      <- tryCatch(pal(row$percent_voted), error=function(e) "#cccccc")
+      if (is.na(fc)) fc <- "#cccccc"
+      proxy %>% addPolygons(
+        data        = row,
+        layerId     = ~ward,
+        fillColor   = fc,
+        fillOpacity = ifelse(is_sel, 1.0, 0.8),
+        color       = ifelse(is_sel, "#f4a261", "#ffffff"),
+        weight      = ifelse(is_sel, 3.5, 1.5),
+        highlightOptions = highlightOptions(
+          weight=3, color="#f4a261", fillOpacity=0.95, bringToFront=TRUE),
+        label = htmltools::HTML(sprintf(
+          "<strong>Ward %s \u2014 %s</strong><br/>Turnout: <strong>%.1f%%</strong>",
+          row$ward, row$ward_name, row$percent_voted)),
+        labelOptions = labelOptions(
+          style=list("font-family"="DM Sans,sans-serif"), direction="auto"))
+    }
+  }
+})
+```
+
+### Voter Turnout vs. Socioeconomic Factors {data-width=520}
+
+```{r scatter-panel}
+# CHANGE 3: Two-level dropdown — first select attribute, then sub-category
+div(style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;",
+  tags$label(style="font-weight:600;color:#1a2744;font-size:1.2rem;white-space:nowrap;",
+             "Explore by:"),
+  selectInput("attr_select", label=NULL,
+    choices=c("Income"="income","Education"="education",
+              "Age"="age","Immigration"="immigration"),
+    selected="income", width="150px"),
+  selectInput("sub_select", label=NULL,
+    choices=c("Under $30k"="under30k","$100k+"="100kplus"),
+    selected="100kplus", width="180px"))
+
+plotlyOutput("scatter_plot", height="390px")
+
+# Update sub_select choices when attr_select changes
+observeEvent(input$attr_select, {
+  updateSelectInput(session, "sub_select",
+    choices = sub_choices[[input$attr_select]],
+    selected = sub_choices[[input$attr_select]][1])
+})
+
+output$scatter_plot <- renderPlotly({
+  attr  <- input$attr_select
+  sub   <- input$sub_select
+  sel_w <- selected_ward()
+  df    <- scatter_data
+  xi    <- get_x(df, attr, sub)
+  if (is.null(xi)) return(plotly_empty())
+  df$xv <- xi$x
+  df    <- df %>% filter(!is.na(xv))
+  df    <- df %>% mutate(
+    pc = if(!is.null(sel_w)) ifelse(ward==sel_w,"#f4a261","#4a90c4") else "#4a90c4",
+    ps = if(!is.null(sel_w)) ifelse(ward==sel_w,14,8) else 9,
+    po = if(!is.null(sel_w)) ifelse(ward==sel_w,1.0,0.45) else 0.72)
+  fit      <- lm(percent_voted~xv, data=df)
+  df$fit   <- predict(fit)
+  r_val    <- cor(df$xv, df$percent_voted, use="complete.obs")
+
+  plot_ly(df, x=~xv, y=~percent_voted, type="scatter", mode="markers",
+    marker=list(color=~pc,size=~ps,opacity=~po,line=list(color="white",width=1.5)),
+    text=~paste0("<b>Ward ",ward," \u2014 ",ward_name,"</b><br>",
+                 "Voter Turnout: ",round(percent_voted,1),"%<br>",
+                 xi$lbl,": ",round(xv,1),"%"),
+    hoverinfo="text", source="scatter") %>%
+  add_lines(data=df%>%arrange(xv), x=~xv, y=~fit, inherit=FALSE,
+    line=list(color="#1a2744",width=1.8,dash="dot"),
+    hoverinfo="none", showlegend=FALSE) %>%
+  layout(
+    font=list(family="DM Sans,sans-serif",color="#1a2744"),
+    xaxis=list(title=list(text=xi$lbl,font=list(size=11)),
+               gridcolor="#e8e6e0",zeroline=FALSE),
+    yaxis=list(title=list(text="Voter Turnout (%)",font=list(size=11)),
+               gridcolor="#e8e6e0",zeroline=FALSE),
+    paper_bgcolor="#ffffff", plot_bgcolor="#fafaf8",
+    margin=list(l=55,r=20,t=20,b=90),
+    annotations=list(
+      list(x=0.99,y=0.01,xref="paper",yref="paper",
+        text=paste0("r = ",round(r_val,2)), showarrow=FALSE,
+        font=list(size=11,color="#999"),xanchor="right",yanchor="bottom"),
+      list(x=0.5,y=-0.22,xref="paper",yref="paper",
+        text=paste0("<i>X-axis: ",xi$lbl,"</i>"), showarrow=FALSE,
+        font=list(size=11,color="#666"),xanchor="center",yanchor="top"))) %>%
+  config(displayModeBar=FALSE) %>%
+  event_register("plotly_click")
+})
+
+observeEvent(event_data("plotly_click", source="scatter"), {
+  cd <- event_data("plotly_click", source="scatter")
+  if(is.null(cd)) return()
+  df <- scatter_data
+  xi <- get_x(df, input$attr_select, input$sub_select)
+  if (is.null(xi)) return()
+  df$xv <- xi$x
+  df <- df %>% filter(!is.na(xv))
+  m  <- df %>% filter(abs(xv-cd$x)<0.5, abs(percent_voted-cd$y)<0.5)
+  if(nrow(m)>0){
+    w <- m$ward[1]
+    if(!is.null(selected_ward())&&selected_ward()==w) selected_ward(NULL) else selected_ward(w)
+  }
+})
+```
+
+## Row {data-height=370}
+
+### Ward Detail {data-width=480}
+
+```{r ward-detail}
+uiOutput("ward_detail")
+
+output$ward_detail <- renderUI({
+  sel_w <- selected_ward()
+  if(is.null(sel_w)) return(
+    div(style="padding:14px;color:#999;font-size:1.5rem;font-style:italic;",
+      "\U0001F447 Click any ward on the map to see details.",
+      tags$br(),
+      tags$span(style="font-size:1.4rem;color:#bbb;","Click the same ward again to deselect.")))
+
+  r <- scatter_data %>% filter(ward==sel_w)
+  if(nrow(r)==0) return(NULL)
+
+  # ── Rankings among all 25 wards ──────────────────────────────────────────
+  n_wards <- nrow(scatter_data)
+  rk_turnout  <- ward_rank(scatter_data$percent_voted,   r$percent_voted)
+  rk_income   <- ward_rank(scatter_data$pct_income_100k_plus, r$pct_income_100k_plus)
+  rk_edu      <- ward_rank(scatter_data$pct_bachelor_plus,    r$pct_bachelor_plus)
+  rk_senior   <- ward_rank(scatter_data$pct_age_65_plus,      r$pct_age_65_plus)
+  rk_imm      <- ward_rank(scatter_data$pct_immigrants,       r$pct_immigrants)
+
+  # Helper to build one rank row with a bar
+  make_rank_row <- function(label, rk, n=25) {
+    pct_bar <- round((n - rk + 1) / n * 100)
+    div(class="rank-row",
+      tags$span(class="rank-label", paste0(label, ":")),
+      div(class="rank-bar-bg",
+        div(class="rank-bar-fill", style=paste0("width:",pct_bar,"%;"))),
+      tags$span(class="rank-badge", paste0("Rank ", rk, " out of ", n)))
+  }
+
+  tagList(
+    # ── Header ──────────────────────────────────────────────────────────────
+    div(style="display:flex;align-items:baseline;gap:8px;margin-bottom:10px;flex-wrap:wrap;",
+      tags$h4(style="margin:0;color:#1a2744;",
+              paste0("Ward ", sel_w, " \u2014 ", r$ward_name)),
+      tags$span(style="font-size:1.4rem;font-weight:700;color:#f4a261;",
+                paste0(round(r$percent_voted, 1), "%")),
+      tags$span(style="color:#999;font-size:0.8rem;", "voter turnout"),
+      tags$span(style="color:#bbb;font-size:0.75rem;",
+                paste0("(", format(r$number_voted, big.mark=","), " / ",
+                       format(r$eligible_voters, big.mark=","), " eligible)"))),
+
+    # ── Stat cards ──────────────────────────────────────────────────────────
+    div(style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px;",
+      lapply(list(
+        list(paste0(round(r$pct_income_100k_plus, 1), "%"), "Income $100k+"),
+        list(paste0(round(r$pct_bachelor_plus, 1),    "%"), "Bachelor's+"),
+        list(paste0(round(r$pct_age_25_to_44, 1),     "%"), "Working Age (25-44)"),
+        list(paste0(round(r$pct_immigrants, 1),        "%"), "Immigrants")),
+        function(s) div(class="ward-card",
+          tags$p(class="wnum", s[[1]]),
+          tags$p(class="wlbl", s[[2]])))),
+
+    # ── Rankings ────────────────────────────────────────────────────────────
+    div(style="border-top:1px solid #e0e4ec;padding-top:8px;",
+      tags$p(style="margin:0 0 6px 0;font-size:1rem;font-weight:600;
+                    color:#1a2744;letter-spacing:0.04em;text-transform:uppercase;",
+             "Rankings among 25 wards (1 = highest)"),
+      make_rank_row("Voter Turnout",    rk_turnout),
+      make_rank_row("Income $100k+",    rk_income),
+      make_rank_row("Bachelor's+",      rk_edu),
+      make_rank_row("Age 65+",          rk_senior),
+      make_rank_row("Immigrants",       rk_imm)
+    )
+  )
+})
+```
+
+### Key Insights {data-width=520}
+
+```{r insights}
+uiOutput("insights_panel")
+
+output$insights_panel <- renderUI({
+  attr  <- input$attr_select
+  sub   <- input$sub_select
+  sel_w <- selected_ward()
+  df    <- scatter_data
+  xi    <- get_x(df, attr, sub)
+  if (is.null(xi)) return(NULL)
+  df$xv <- xi$x
+  df    <- df %>% filter(!is.na(xv))
+
+  r_val    <- cor(df$xv, df$percent_voted, use="complete.obs")
+  dir_lbl  <- ifelse(r_val>0,"positive","negative")
+  str_lbl  <- ifelse(abs(r_val)>0.6,"strong",ifelse(abs(r_val)>0.3,"moderate","weak"))
+  top_w <- df %>% slice_max(percent_voted,n=1)
+  bot_w <- df %>% slice_min(percent_voted,n=1)
+  cy    <- mean(df$percent_voted,na.rm=TRUE)
+  cx    <- mean(df$xv,na.rm=TRUE)
+
+  i1 <- div(class="insight-box", HTML(paste0(
+    "\U0001F4CA <strong>Correlation:</strong> There is a <strong>",
+    str_lbl," ",dir_lbl,"</strong> relationship (r\u00a0=\u00a0",round(r_val,2),
+    ") between <em>",xi$lbl,"</em> and voter turnout across Toronto's 25 wards.")))
+
+  i2 <- div(class="insight-box", HTML(paste0(
+    "\U0001F3C6 <strong>Highest:</strong> Ward ",top_w$ward," (",top_w$ward_name,
+    ") at <strong>",round(top_w$percent_voted,1),"%</strong>. &nbsp;",
+    "\u2B07\uFE0F <strong>Lowest:</strong> Ward ",bot_w$ward," (",bot_w$ward_name,
+    ") at <strong>",round(bot_w$percent_voted,1),"%</strong>.")))
+
+  i3 <- if(!is.null(sel_w)){
+    rv <- df %>% filter(ward==sel_w)
+    if(nrow(rv)>0){
+      dt <- round(rv$percent_voted-cy,1); dx <- round(rv$xv-cx,1)
+      st <- ifelse(dt>=0,paste0("+",dt),as.character(dt))
+      sx <- ifelse(dx>=0,paste0("+",dx),as.character(dx))
+      div(class="insight-box insight-sel", HTML(paste0(
+        "\U0001F4CD <strong>Ward ",sel_w," vs. City Avg:</strong> Turnout ",
+        round(rv$percent_voted,1),"% (",st,"pp). Selected factor: ",
+        round(rv$xv,1),"% (",sx,"pp).")))
+    }
+  } else {
+    div(class="insight-box",style="opacity:0.5;", HTML(
+      "\U0001F4CD <strong>Ward comparison:</strong> Select a ward to compare against the city average."))
+  }
+  tagList(i1, i2, i3)
+})
+```
